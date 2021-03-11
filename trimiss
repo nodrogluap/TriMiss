@@ -1,0 +1,291 @@
+#!/usr/bin/env perl
+
+# Paul Gordon (gordonp@ucalgary.ca), 2021
+
+use strict;
+use warnings;
+
+# Nearest neighbour (nn) model of DNA enthalpy in kcal/mol
+# From SantaLucia (1998), PNAS 95:1460-1465
+my %nn_h = qw(
+aa -7.9
+tt -7.9
+at -7.2
+ta -7.2
+ca -8.5
+tg -8.5
+gt -8.4
+ac -8.4
+ct -7.8
+ag -7.8
+ga -8.2
+tc -8.2
+cg -10.6
+gc -9.8
+gg -8.0
+cc -8.0
+);
+
+# Nearest neighbour (nn) model of DNA entropy in cal/K·mol
+# From SantaLucia (1998), PNAS 95:1460-1465
+my %nn_s = qw(
+aa -22.2
+tt -22.2
+at -20.4
+ta -21.3
+ca -22.7
+tg -22.7
+gt -22.4
+ac -22.4
+ct -21.0
+ag -21.0
+ga -22.2
+tc -22.2
+cg -27.2
+gc -24.4
+gg -19.9
+cc -19.9
+);
+
+# Self mismatch data from Peyret et al (1999) Biochem. 38:3468-77
+# NOTE: A-C mismatches are highly pH sensitive. The default values
+# used are for pH of 7.
+my %nn_one_mismatch_h = qw(
+aa,tc 2.3
+ac,ta 5.3
+ca,gc 1.9
+cc,ga 0.6
+ga,cc 5.2
+gc,ca -0.7
+ta,ac 3.4
+tc,aa 7.6
+
+aa,tg -0.6
+ag,ta -0.7
+ca,gg -0.7
+cg,ga -4.0
+ga,cg -0.6
+gg,ca 0.5
+ta,ag 0.7
+tg,aa 3.0
+
+ac,tt 0.7
+at,tc -1.2
+cc,gt -0.8
+ct,gc -1.5
+gc,ct 2.3
+gt,cc 5.2
+tc,at 1.2
+tt,ac 1.0
+
+ag,tt 1.0
+at,tg -2.5
+cg,gt -4.1
+ct,gg -2.8
+gg,ct 3.3
+gt,cg -4.4
+tg,at -0.1
+tt,ag -1.3
+
+aa,ta 1.2
+ca,ga -0.9
+ga,ca -2.9
+ta,aa 4.7
+
+ac,tc 0.0
+cc,gc -1.5
+gc,cc 3.6
+tc,ac 6.1
+
+ag,tg -3.1
+cg,gg -4.9
+gg,cg -6.0
+tg,ag 1.6
+
+at,tt -2.7
+ct,gt -5.0
+gt,ct -2.2
+tt,at 0.2
+);
+
+# Self mismatch data from Peyret et al (1999) Biochem. 38:3468-77
+my %nn_one_mismatch_s = qw(
+aa,tc 4.6
+ac,ta 14.6
+ca,gc 3.7
+cc,ga -0.6
+ga,cc 14.2
+gc,ca -3.8
+ta,ac 8.0
+tc,aa 20.2
+
+aa,tg -2.3
+ag,ta -2.3
+ca,gg -2.3
+cg,ga -13.2
+ga,cg -1.0
+gg,ca 3.2
+ta,ag 0.7
+tg,aa 7.4
+
+ac,tt 0.2
+at,tc -6.2
+cc,gt -4.5
+ct,gc -6.1
+gc,ct 5.4
+gt,cc 13.5
+tc,at 0.7
+tt,ac 0.7
+
+ag,tt 0.9
+at,tg -8.3
+cg,gt -11.7
+ct,gg -8.0
+gg,ct 10.4
+gt,cg -12.3
+tg,at -1.7
+tt,ag -5.3
+
+aa,ta 1.7
+ca,ga -4.2
+ga,ca -9.8
+ta,aa 12.9
+
+ac,tc -4.4
+cc,gc -7.2
+gc,cc 8.9
+tc,ac 16.4
+
+ag,tg -9.5
+cg,gg -15.3
+gg,cg -15.8
+tg,ag 3.6
+
+at,tt -10.8
+ct,gt -15.8
+gt,ct -8.4
+tt,at -1.5
+);
+
+@ARGV == 6 or die "Usage: $0 <template.fasta> <primer length> <template conc> <primer conc> <cation conc1,conc2,...> <output mismatch trinucleotide effects.tsv>\n";
+
+my $template_fasta = shift @ARGV;
+my $primer_length = shift @ARGV;
+my $template_conc = shift @ARGV;
+my $primer_conc = shift @ARGV;
+my @cation_concs = split /,/, shift(@ARGV);
+my $out_file = shift @ARGV;
+
+my @bases = qw(a c g t);
+my %complement = (a => 't', c => 'g', g => 'c', t => 'a');
+
+my %kmers;
+open(FASTA, $template_fasta)
+	or die "Cannot open $template_fasta for reading\n";
+my $seq = "";
+while(<FASTA>){
+	chomp;
+	if(/^>/){
+		if($seq){ # multi-fasta file
+			&add_kmers(\%kmers, $seq, $primer_length);
+			$seq = "";
+		}
+	}
+	else{
+		s/\s//g; # strip any whitespace
+		$seq .= $_;
+	}
+}
+&add_kmers(\%kmers, $seq, $primer_length);
+close(FASTA);
+
+# Calculate enthalpy/entropy ratio at a given cation concentration (based on Santa Lucia salt correction -0.368*ln(conc)) 
+# for all combinations of three bases with a middle mismatch, i.e. non-complementary n2 and n4 for the configuration
+#
+# 5'-n1-n2-n5-3'
+# 3'-n3-n4-n6-5'
+#
+my %trinucleotide_H; # match, key is "n1n2n5"
+my %trinucleotide_S;
+my %trinucleotide_mH; # mismatch, key is "n1n2n5,n3n4n6"
+my %trinucleotide_mS;
+for my $n1 (@bases){
+	for my $n2 (@bases){ # in our thermodynamics tables of keys "n1n2,n3n4", n1 and n3 are always complementary so no need to check
+		for my $n4 (@bases){
+			next if $n4 eq $complement{$n2}; # No mismatch, so not in the tables
+			my $dH_n1n2n3n4 = $nn_one_mismatch_h{$n1.$n2.",".$complement{$n1}.$n4};
+			my $dS_n1n2n3n4 = $nn_one_mismatch_s{$n1.$n2.",".$complement{$n1}.$n4};
+			for my $n5 (@bases){
+				my $trinucleotide_config = $n1.$n2.$n5.",".$complement{$n1}.$n4.$complement{$n5};
+				next if exists $trinucleotide_mH{$trinucleotide_config};
+				my $dH_n6n4n5n2 = $nn_one_mismatch_h{$complement{$n5}.$n4.",".$n5.$n2};
+				my $dS_n6n4n5n2 = $nn_one_mismatch_h{$complement{$n5}.$n4.",".$n5.$n2};
+				$trinucleotide_mH{$trinucleotide_config} = $dH_n1n2n3n4+$dH_n6n4n5n2;
+				$trinucleotide_mS{$trinucleotide_config} = $dS_n1n2n3n4+$dS_n6n4n5n2;
+				if(not exists $trinucleotide_H{$n1.$n2.$n5}){
+					$trinucleotide_H{$n1.$n2.$n5} = $nn_h{$n1.$n2}+$nn_h{$complement{$n5}.$complement{$n2}};
+					$trinucleotide_S{$n1.$n2.$n5} = $nn_s{$n1.$n2}+$nn_s{$complement{$n5}.$complement{$n2}};
+				}
+			}
+		}	
+	}
+}
+
+my $R = 1.987; # the molar gas constant in cal/K⋅mol, to match entropy units
+open(OUT, ">$out_file")
+	or die "Cannot open $out_file for writing: $!\n";
+print OUT join("\t","seq", map {"cation_conc_".$_} @cation_concs),"\n";
+for my $trinucleotide_config (sort keys %trinucleotide_mH){
+	my @min_conc_melts;
+	for my $cation_conc (@cation_concs){
+		my ($first_strand, $second_strand) = split /,/, $trinucleotide_config;
+		my $salt_dependent_S = $trinucleotide_S{$first_strand} * 0.368*log($cation_conc);
+		my $salt_dependent_mS = $trinucleotide_mS{$trinucleotide_config} * 0.368*log($cation_conc);
+		my $mismatch_delta_S = $salt_dependent_mS-$salt_dependent_S;
+		my $mismatch_delta_H = $trinucleotide_mH{$trinucleotide_config}-$trinucleotide_H{$first_strand};
+		my $min_melting_temp_delta = 1000;
+		my $max_melting_temp_delta = -1000;
+		for my $kmer (keys %kmers){
+			next if index($kmer, $first_strand) == -1; # the trinucleotide is not found in this kmer
+			my $kmer_H = &nn_sum(\%nn_h, $kmer);
+			my $kmer_S = &nn_sum(\%nn_s, $kmer);
+			my $melting_temp_match = 1000*$kmer_H/($kmer_S + $R*$primer_length*log(($template_conc+$primer_conc)/2));
+			my $melting_temp_mismatch = 1000*($kmer_H+$mismatch_delta_H)/($kmer_S+$mismatch_delta_S + $R*$primer_length*log(($template_conc+$primer_conc)/2));
+			my $melting_temp_delta = $melting_temp_mismatch - $melting_temp_match;
+			if($melting_temp_delta > $max_melting_temp_delta){
+				$max_melting_temp_delta = $melting_temp_delta;
+			}
+			if($melting_temp_delta < $min_melting_temp_delta){
+				$min_melting_temp_delta = $melting_temp_delta;
+			}
+		}
+		next if $min_melting_temp_delta == 1000; # implies that this trinucleotide is not found in the provided sequence
+		push @min_conc_melts, $min_melting_temp_delta;
+	}
+	print OUT join("\t", $trinucleotide_config, @min_conc_melts), "\n" if @min_conc_melts;
+}
+close(OUT);
+
+sub add_kmers($$){
+	my ($kmers_ref, $seq, $kmer_length) = @_;
+	return if length($seq) < $kmer_length; # no kmers to process
+	$seq = lc($seq); # do everything lower case like the hash keys
+	for my $pos (0 .. (length($seq)-$kmer_length)){
+		$kmers_ref->{substr($seq, $pos, $kmer_length)}++; # kmer counting with auto-vivification
+	}
+}
+
+sub nn_sum($$){
+	my ($nn_ref, $kmer) = @_;
+	return if length($kmer) < 2;
+	my $sum = 0;
+	for my $pos (0 .. length($kmer)-2){
+		my $nn = substr($kmer, $pos, 2);
+		if(not exists $nn_ref->{$nn}){
+			warn "Cannot process nearest neighbours $nn, not in the thermodynamics tables, skipping\n";
+			next;
+		}
+		$sum += $nn_ref->{$nn};
+	}
+	return $sum;
+}
