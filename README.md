@@ -8,7 +8,7 @@ Calculate the effect of three nucleotide ("Tri") contexts for every possible sin
 ## Quick Start
 Requires that you have plain old Perl on your system.
 
-To calculate a table with melting temperature drops for all 192 flanking base SNP contexts in the SARS-CoV-2 genome, with a primer length of 33, and cation (e.g. Na+, Ka+, Mg+) concentrations of 0.8mM, 8mM, and 80mM:
+To calculate a table with melting temperature drops for all 192 flanking base SNP contexts in the SARS-CoV-2 genome, with a primer length of 33, and cation (e.g. Na+, Mg+) concentrations of 8mM, 80mM, and 800mM:
 ```
 ./trimiss sars-cov-2.fa 33 1e-17 6e-10 8e-3,8e-2,8e-1 output_melting_tms_all_three_concs.tsv
 ```
